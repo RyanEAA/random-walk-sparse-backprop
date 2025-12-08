@@ -108,5 +108,3 @@ For sparse gradient masking approaches, see:
 - Evci et al. (2020), RigL  
 - Mohtashami (2022), Masked Training of Neural Networks with Partial Gradients  
 - Jaiswal (2022), Training Your Sparse Neural Network Better with Any Mask
-
-
