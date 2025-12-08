@@ -1,6 +1,6 @@
 # Random-Walk Sparse Backpropagation on MNIST
 
-This repo contains a small experiment exploring **sparse gradient updates** using
+This repo contains an experiment exploring **sparse gradient updates** using
 random walks through a feedforward neural network trained on MNIST.
 
 Instead of updating all weights via standard backpropagation, we:
@@ -56,10 +56,57 @@ approximation to full backpropagation**.
 Clone the repo and install dependencies:
 
 ```bash
-git clone https://github.com/ryaneaa/random-walk-sparse-backprop.git
-cd mnist-random-walk-sparse-backprop
+git clone https://github.com/RyanEAA/random-walk-sparse-backprop.git
+cd random-walk-sparse-backprop
+
+python3 -m venv .venv
+source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
 
-Then run jupyter notebook
+run Jupyter Notebook
+
+---
+
+## Definitions
+
+**Density** = the mean fraction of trainable parameters receiving non-zero gradients after masking.
+
+---
+
+## Prelim Results
+
+Model: 3-layer MLP with ReLU activations  
+Dimensions: 784 → 256 → 128 → 10
+
+| Method | Epochs | Fraction of Parameters Updated per Epoch (%) | Test Accuracy |
+| -------------------------- | ------ | ------------------: | ------------: |
+| **Full Backprop**          | 5      |               100.0 |        ~97.5% |
+| **RW-Target (10 paths)**   | 5      |               0.023 |          ~86% |
+| **RW-Target (50 paths)**   | 5      |                0.10 |          ~90% |
+| **RW-Target (200 paths)**  | 5      |                0.35 |          ~92% |
+| **RW-Target (500 paths)**  | 5      |                0.70 |          ~94% |
+| **RW-Target (1000 paths)** | 5      |                1.20 |        ~95.6% |
+
+![alt text](image.png)
+
+## TODO (Dec–Jan)
+
+- [ ] CIFAR-10 experiments (CNN)
+- [ ] Fashion-MNIST experiments
+- [ ] Fine-tuning dense → sparse transition
+- [ ] Random-walk path parallelization
+- [ ] Literature review summary
+
+
+## Related Work
+
+For sparse gradient masking approaches, see:
+
+- Frankle & Carbin (2019), Lottery Ticket Hypothesis  
+- Evci et al. (2020), RigL  
+- Mohtashami (2022), Masked Training of Neural Networks with Partial Gradients  
+- Jaiswal (2022), Training Your Sparse Neural Network Better with Any Mask
+
+
