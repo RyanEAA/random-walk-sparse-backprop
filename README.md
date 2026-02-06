@@ -204,6 +204,7 @@ Planned directions include:
    * apply RW-Sparse to classifier heads of CNNs
    * extend to transformer MLP blocks
    * explore sparse backward rules for Conv2D
+   * explore sparse backward for kolmogorov arnold networks
 
 3. **Algorithmic variants**
 
