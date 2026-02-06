@@ -1,247 +1,450 @@
+#!/usr/bin/env python3
+"""
+run_experiments.py
+
+Runs training for multiple num_paths values and logs results to metrics.csv.
+
+Design:
+- Training is script-based, reproducible.
+- Plotting is separate (see plot_results.py).
+- Logs per-epoch metrics:
+    test_acc, train_loss, elapsed_s, cumulative_param_updates, avg_step_ms
+
+Works with:
+- Option B (row-sparse backward) in randomwalk.py:
+    - RandomWalkRowSampler
+    - RandomWalkConfig
+    - SparseMLPWrapper
+
+Notes:
+- This script uses MNIST/FashionMNIST by default.
+- CIFAR-10 later once we wrap conv layers or use sparse only on classifier head.
+"""
+
+from __future__ import annotations
+
 import argparse
+import csv
+import json
+import os
 import time
-from dataclasses import dataclass
-from typing import Tuple, Optional, Dict
+import uuid
+from dataclasses import asdict
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
+from torch.utils.data import DataLoader
+
+# torchvision is typical for MNIST/FashionMNIST
 from torchvision import datasets, transforms
 
-# Import your masker
-from randomwalkmask import RandomWalkMasker
+# Import your Option B components
+from randomwalk import (
+    RandomWalkConfig,
+    RandomWalkRowSampler,
+    SparseMLPWrapper,
+)
 
 
 # ----------------------------
-# Models
+# Simple MLP (matches randomwalk.py demo expectations)
 # ----------------------------
 
 class SimpleMLP(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int = 10):
+    def __init__(self, in_dim=784, h1=256, h2=128, out_dim=10):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, num_classes)
+        self.fc1 = nn.Linear(in_dim, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, out_dim)
 
     def forward(self, x):
         x = x.view(x.size(0), -1)  # flatten
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        return self.fc3(x)
-
-
-class SmallCNN(nn.Module):
-    """
-    CIFAR-10 friendly CNN. We'll apply RW masking only to the Linear classifier head.
-    """
-    def __init__(self, num_classes: int = 10):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 16x16
-
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 8x8
-        )
-        self.fc1 = nn.Linear(64 * 8 * 8, 256)
-        self.fc2 = nn.Linear(256, num_classes)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)
+        x = self.fc3(x)
+        return x
 
 
 # ----------------------------
-# Data
+# Utils
 # ----------------------------
 
-def get_loaders(dataset: str, batch_size: int, num_workers: int = 2):
-    dataset = dataset.lower()
-
-    if dataset in ("mnist", "fashionmnist"):
-        tfm = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,)),
-        ])
-
-        ds_cls = datasets.MNIST if dataset == "mnist" else datasets.FashionMNIST
-        train_ds = ds_cls(root="./data", train=True, download=True, transform=tfm)
-        test_ds = ds_cls(root="./data", train=False, download=True, transform=tfm)
-
-    elif dataset == "cifar10":
-        tfm_train = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465),
-                                 (0.2470, 0.2435, 0.2616)),
-        ])
-        tfm_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465),
-                                 (0.2470, 0.2435, 0.2616)),
-        ])
-
-        train_ds = datasets.CIFAR10(root="./data", train=True, download=True, transform=tfm_train)
-        test_ds = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm_test)
-
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
-
-    train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
-    )
-    test_loader = torch.utils.data.DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
-    )
-    return train_loader, test_loader
+def set_seeds(seed: int):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def build_model(dataset: str) -> nn.Module:
-    dataset = dataset.lower()
-    if dataset in ("mnist", "fashionmnist"):
-        # 28x28 grayscale
-        return SimpleMLP(input_dim=28 * 28, num_classes=10)
-    elif dataset == "cifar10":
-        return SmallCNN(num_classes=10)
-    else:
-        raise ValueError(dataset)
+def get_device(device_str: str) -> torch.device:
+    if device_str == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but not available.")
+        return torch.device("cuda")
+    if device_str == "cpu":
+        return torch.device("cpu")
+    # auto
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ----------------------------
-# Train / Eval
-# ----------------------------
-
-@dataclass
-class EpochStats:
-    train_loss: float
-    train_acc: float
-    test_loss: float
-    test_acc: float
-    density: Optional[float] = None
-    epoch_time_sec: Optional[float] = None
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
 @torch.no_grad()
-def eval_epoch(model: nn.Module, loader, device) -> Tuple[float, float]:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
-    total_loss = 0.0
     correct = 0
     total = 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        logits = model(x)
-        loss = F.cross_entropy(logits, y)
-        total_loss += loss.item() * x.size(0)
-        preds = logits.argmax(dim=1)
-        correct += (preds == y).sum().item()
-        total += x.size(0)
-    return total_loss / total, correct / total
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        logits = model(xb)
+        pred = logits.argmax(dim=1)
+        correct += (pred == yb).sum().item()
+        total += yb.numel()
+    return correct / max(total, 1)
 
 
-def train_epoch(
-    model: nn.Module,
-    loader,
-    optimizer,
-    device,
-    mode: str,
-    masker: Optional[RandomWalkMasker] = None,
-) -> Tuple[float, float, Optional[float]]:
-    model.train()
-    total_loss = 0.0
-    correct = 0
+def count_param_updates_for_selected_rows(
+    sparse_wrapper: SparseMLPWrapper,
+    selected_rows_fwd: List[torch.Tensor],
+) -> int:
+    """
+    Row-sparse Option B update count per step.
+
+    For each Linear layer with weight shape [out, in]:
+      - weights updated: |I| * in
+      - bias updated: |I| (if bias present)
+    """
     total = 0
-    densities = []
+    for lin, I in zip(sparse_wrapper.linears_fwd, selected_rows_fwd):
+        k = int(I.numel())
+        total += k * lin.in_features
+        if lin.bias is not None:
+            total += k
+    return total
 
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
+def maybe_cuda_sync(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
-        logits = model(x)
-        loss = F.cross_entropy(logits, y)
-        loss.backward()
 
-        if mode != "full":
-            if masker is None:
-                raise ValueError("masker is required for mode != 'full'")
-            stats = masker.apply(model, labels=y if "target" in mode else None)
-            densities.append(stats.density)
-
-        optimizer.step()
-
-        total_loss += loss.item() * x.size(0)
-        preds = logits.argmax(dim=1)
-        correct += (preds == y).sum().item()
-        total += x.size(0)
-
-    avg_loss = total_loss / total
-    acc = correct / total
-    avg_density = float(sum(densities) / len(densities)) if densities else None
-    return avg_loss, acc, avg_density
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
 
 # ----------------------------
-# Main experiment runner
+# Training (Option B)
 # ----------------------------
 
-def run_one(dataset: str, mode: str, num_paths: int, epochs: int, batch_size: int, lr: float, device: str):
-    train_loader, test_loader = get_loaders(dataset, batch_size=batch_size)
+def train_one_run(
+    *,
+    run_dir: Path,
+    dataset_name: str,
+    num_paths: int,
+    seed: int,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    epsilon_greedy: float,
+    weight_temperature: float,
+    min_rows_per_layer: int,
+    log_every_steps: int,
+    mode: str, # "full" or "rw_sparse
+) -> Path:
+    """
+    Trains one configuration and appends metrics rows to run_dir/metrics.csv.
+    Returns metrics path.
+    """
+    ensure_dir(run_dir)
+    metrics_path = run_dir / "metrics.csv"
+    config_path = run_dir / "config.json"
 
-    model = build_model(dataset).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    # Build masker for sparse modes
-    masker = None
-    if mode != "full":
-        masker = RandomWalkMasker(
-            mode=mode,  # "rw_random" or "rw_target"
-            num_paths=num_paths,
-            include_bias=True,
-            device=torch.device(device),
-        )
-
-    if mode == "full":
-        print(f"\n=== Dataset={dataset.upper()} | Mode={mode} | epochs={epochs} ===")
+    # Data
+    tfm = transforms.Compose([transforms.ToTensor()])
+    if dataset_name.lower() == "mnist":
+        train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=tfm)
+        test_ds = datasets.MNIST(root="./data", train=False, download=True, transform=tfm)
+    elif dataset_name.lower() in ("fashionmnist", "fashion_mnist", "fmnist"):
+        train_ds = datasets.FashionMNIST(root="./data", train=True, download=True, transform=tfm)
+        test_ds = datasets.FashionMNIST(root="./data", train=False, download=True, transform=tfm)
     else:
-        print(f"\n=== Dataset={dataset.upper()} | Mode={mode} | num_paths={num_paths} | epochs={epochs} ===")
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-    for ep in range(1, epochs + 1):
-        t0 = time.time()
-        tr_loss, tr_acc, density = train_epoch(model, train_loader, optimizer, device, mode, masker)
-        te_loss, te_acc = eval_epoch(model, test_loader, device)
-        t1 = time.time()
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=(device.type == "cuda"))
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=(device.type == "cuda"))
 
-        if density is None:
-            print(f"[Epoch {ep}] Train loss {tr_loss:.4f}, acc {tr_acc:.4f} | "
-                  f"Test loss {te_loss:.4f}, acc {te_acc:.4f} | time {t1-t0:.1f}s")
-        else:
-            print(f"[Epoch {ep}] Train loss {tr_loss:.4f}, acc {tr_acc:.4f}, density {density:.6f} | "
-                  f"Test loss {te_loss:.4f}, acc {te_acc:.4f} | time {t1-t0:.1f}s")
+    # Model
+    model = SimpleMLP().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    # Sparse wrapper + sampler
+    # We trace with an example input shaped like a batch element:
+    example_x, _ = next(iter(train_loader))
+    example_x = example_x[:1].to(device)
+    sparse_wrapper = None
+    sampler = None
+
+    if mode == "rw_sparse":
+        sparse_wrapper = SparseMLPWrapper(model, example_input=example_x)
+
+        rw_cfg = RandomWalkConfig(
+            num_paths=num_paths,
+            start_uniform=True,
+            epsilon_greedy=epsilon_greedy,
+            weight_temperature=weight_temperature,
+            min_rows_per_layer=min_rows_per_layer,
+            device=device,
+        )
+        sampler = RandomWalkRowSampler(rw_cfg)
+
+    config_payload = {
+        "timestamp": now_iso(),
+        "dataset": dataset_name,
+        "mode": mode,
+        "num_paths": num_paths if mode == "rw_sparse" else None,
+        "seed": seed,
+        "device": str(device),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+    }
+
+    if mode == "rw_sparse":
+        rw_cfg_dict = asdict(rw_cfg)
+        rw_cfg_dict["device"] = str(rw_cfg_dict.get("device"))
+        config_payload["randomwalk_config"] = rw_cfg_dict
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config_payload, f, indent=2)
+
+
+
+    # Prepare CSV (append-safe)
+    write_header = not metrics_path.exists()
+    with open(metrics_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "run_id",
+                "dataset",
+                "mode",
+                "num_paths",
+                "seed",
+                "epoch",
+                "step",
+                "train_loss",
+                "test_acc",
+                "elapsed_s",
+                "avg_step_ms",
+                "cumulative_param_updates",
+            ],
+        )
+        if write_header:
+            writer.writeheader()
+
+        run_id = run_dir.name
+
+        cumulative_updates = 0
+        global_step = 0
+
+        t0 = time.perf_counter()
+
+        for epoch in range(1, epochs + 1):
+            model.train()
+            running_loss = 0.0
+            n_batches = 0
+
+            # step timing window
+            step_times: List[float] = []
+            window_start = None
+
+            for xb, yb in train_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                maybe_cuda_sync(device)
+                t_step_start = time.perf_counter()
+
+                opt.zero_grad(set_to_none=True)
+
+                if mode == "full":
+                    logits = model(xb)
+                    loss = criterion(logits, yb)
+                    loss.backward()
+                    opt.step()
+
+                    # FULL updates all params
+                    updates_this_step = sum(p.numel() for p in model.parameters())
+
+                elif mode == "rw_sparse":
+                    selected_rows = sampler.sample_selected_rows(sparse_wrapper.linears_fwd)
+                    logits = sparse_wrapper(xb.view(xb.size(0), -1), selected_rows)
+                    loss = criterion(logits, yb)
+                    loss.backward()
+                    opt.step()
+
+                    updates_this_step = count_param_updates_for_selected_rows(
+                        sparse_wrapper, selected_rows
+                    )
+
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+
+                cumulative_updates += updates_this_step
+
+                running_loss += loss.item()
+                n_batches += 1
+                global_step += 1
+
+                maybe_cuda_sync(device)
+                t_step_end = time.perf_counter()
+                step_times.append((t_step_end - t_step_start) * 1000.0)
+
+                # Optional: log intra-epoch (not required for plots; useful for long runs)
+                if log_every_steps > 0 and (global_step % log_every_steps == 0):
+                    elapsed = time.perf_counter() - t0
+                    avg_step_ms = sum(step_times[-min(len(step_times), 50):]) / max(min(len(step_times), 50), 1)
+                    # quick test acc occasionally is expensive; skip
+                    writer.writerow(
+                        {
+                            "run_id": run_id,
+                            "dataset": dataset_name,
+                            "mode": mode,
+                            "num_paths": num_paths,
+                            "seed": seed,
+                            "epoch": epoch,
+                            "step": global_step,
+                            "train_loss": running_loss / max(n_batches, 1),
+                            "test_acc": "",
+                            "elapsed_s": elapsed,
+                            "avg_step_ms": avg_step_ms,
+                            "cumulative_param_updates": cumulative_updates,
+                        }
+                    )
+                    f.flush()
+
+            # Epoch end eval
+            elapsed = time.perf_counter() - t0
+            train_loss_epoch = running_loss / max(n_batches, 1)
+            test_acc = evaluate(model, test_loader, device)
+
+            avg_step_ms_epoch = sum(step_times) / max(len(step_times), 1)
+
+            writer.writerow(
+                {
+                    "run_id": run_id,
+                    "dataset": dataset_name,
+                    "mode": mode,
+                    "num_paths": num_paths,
+                    "seed": seed,
+                    "epoch": epoch,
+                    "step": global_step,
+                    "train_loss": train_loss_epoch,
+                    "test_acc": test_acc,
+                    "elapsed_s": elapsed,
+                    "avg_step_ms": avg_step_ms_epoch,
+                    "cumulative_param_updates": cumulative_updates,
+                }
+            )
+            f.flush()
+
+            print(
+                f"[{run_id}] epoch {epoch:02d}/{epochs} | "
+                f"mode={mode} | num_paths={num_paths if mode=='rw_sparse' else 'FULL'} | "
+                f"train_loss={train_loss_epoch:.4f} | test_acc={test_acc:.4f} | "
+                f"elapsed_s={elapsed:.1f} | avg_step_ms={avg_step_ms_epoch:.2f} | "
+                f"cum_updates={cumulative_updates}"
+            )
+
+    return metrics_path
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "fashionmnist"])
+    p.add_argument("--num-paths", type=str, default="10,50,200,500,1000",
+                   help="Comma-separated list, e.g. '10,50,200,500,1000'")
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--results-dir", type=str, default="results")
+    p.add_argument("--epsilon-greedy", type=float, default=0.0)
+    p.add_argument("--weight-temperature", type=float, default=1.0)
+    p.add_argument("--min-rows-per-layer", type=int, default=1)
+    p.add_argument("--log-every-steps", type=int, default=0,
+                   help="If >0, appends extra rows (without test_acc) every N steps")
+    return p.parse_args()
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--dataset", type=str, default="mnist", choices=["mnist", "fashionmnist", "cifar10", "all"])
-    p.add_argument("--mode", type=str, default="full", choices=["full", "rw_random", "rw_target"])
-    p.add_argument("--num_paths", type=int, default=200)
-    p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    args = p.parse_args()
+    args = parse_args()
+    set_seeds(args.seed)
+    device = get_device(args.device)
 
-    if args.dataset == "all":
-        for ds in ["mnist", "fashionmnist", "cifar10"]:
-            run_one(ds, args.mode, args.num_paths, args.epochs, args.batch_size, args.lr, args.device)
-    else:
-        run_one(args.dataset, args.mode, args.num_paths, args.epochs, args.batch_size, args.lr, args.device)
+    num_paths_list = [int(s.strip()) for s in args.num_paths.split(",") if s.strip()]
+    results_root = Path(args.results_dir)
+    ensure_dir(results_root)
 
+    # ------------------
+    # FULL BASELINE (run once)
+    # ------------------
+    run_id = f"{args.dataset}_FULL_seed{args.seed}_{uuid.uuid4().hex[:8]}"
+    run_dir = results_root / run_id
+
+    train_one_run(
+        run_dir=run_dir,
+        dataset_name=args.dataset,
+        num_paths=0,
+        seed=args.seed,
+        device=device,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        epsilon_greedy=0.0,
+        weight_temperature=1.0,
+        min_rows_per_layer=0,
+        log_every_steps=args.log_every_steps,
+        mode="full",
+    )
+
+    # ------------------
+    # RW-SPARSE runs
+    # ------------------
+    for num_paths in num_paths_list:
+        run_id = f"{args.dataset}_rw_sparse_np{num_paths}_seed{args.seed}_{uuid.uuid4().hex[:8]}"
+        run_dir = results_root / run_id
+
+        train_one_run(
+            run_dir=run_dir,
+            dataset_name=args.dataset,
+            num_paths=num_paths,
+            seed=args.seed,
+            device=device,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            epsilon_greedy=args.epsilon_greedy,
+            weight_temperature=args.weight_temperature,
+            min_rows_per_layer=args.min_rows_per_layer,
+            log_every_steps=args.log_every_steps,
+            mode="rw_sparse",
+        )
+
+    print("\nDone. Plot with:\n  python plot_results.py --results-dir results\n")
+    print("\nDone. Save Plots with:\n  python plot_results.py --results-dir results --save-dir plots --speed-bars\n")
 
 if __name__ == "__main__":
     main()

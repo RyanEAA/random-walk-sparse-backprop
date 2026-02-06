@@ -1,0 +1,19 @@
+{
+  "timestamp": "2026-02-06T03:50:43",
+  "dataset": "mnist",
+  "mode": "rw_sparse",
+  "num_paths": 10,
+  "seed": 0,
+  "device": "cpu",
+  "epochs": 5,
+  "batch_size": 128,
+  "lr": 0.001,
+  "randomwalk_config": {
+    "num_paths": 10,
+    "start_uniform": true,
+    "epsilon_greedy": 0.0,
+    "weight_temperature": 1.0,
+    "min_rows_per_layer": 1,
+    "device": "cpu"
+  }
+}

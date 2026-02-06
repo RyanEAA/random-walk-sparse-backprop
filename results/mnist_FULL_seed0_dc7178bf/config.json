@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-02-06T03:58:59",
+  "dataset": "mnist",
+  "mode": "full",
+  "num_paths": null,
+  "seed": 0,
+  "device": "cpu",
+  "epochs": 5,
+  "batch_size": 128,
+  "lr": 0.001
+}
